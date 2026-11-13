@@ -1,0 +1,246 @@
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { commandLinesMatching } from './helpers/process-tree.js'
+import type { TestContext } from 'node:test'
+import {
+  gatewayTimeout,
+  launchGateway,
+  rpc,
+  unusedPort,
+  requestTimeout,
+} from './helpers/gateway-process.js'
+
+/**
+ * Which configurations actually reap the child a request spawned?
+ *
+ * A stateless child belongs to one request; a stateful child belongs to a
+ * session spanning multiple HTTP requests. Response completion is therefore
+ * not a universal cleanup trigger. The expected lifetime depends on the mode:
+ *
+ *   explicit DELETE        stateless: no sessions      stateful: yes
+ *   idle timer             stateless: none             stateful: only with --sessionTimeout
+ *   completed request        stateless: reaped        stateful: feeds the session counter,
+ *                                                      which is null without --sessionTimeout
+ *
+ * #108 is a completed-request leak. The former #141 TODO below incorrectly
+ * expected initialized stateful sessions with no timeout or DELETE to vanish.
+ * It did not reproduce an actual transport-close leak. Preserve those sessions
+ * and test the reported close-path issue separately before claiming it fixed.
+ *
+ * Children are counted by a marker passed to the peer's own argv, and the
+ * gateway is excluded from the count because the peer command — marker and all
+ * — appears in the gateway's argv too, which is how it was told what to spawn.
+ */
+const peerWithMarker = (marker: string) =>
+  `node tests/clients/battery-peer.mjs ${marker}`
+
+// The servers carrying `marker`, not the gateway (`gatewayPid`), whatever it
+// runs as: on every platform, and never an empty list because the process
+// table could not be read.
+function liveChildren(marker: string, gatewayPid: number) {
+  return commandLinesMatching(marker).filter(
+    (line) => Number(line.trim().split(/\s+/)[0]) !== gatewayPid,
+  )
+}
+
+const headers = (session?: string) => ({
+  'content-type': 'application/json',
+  accept: 'application/json, text/event-stream',
+  ...(session ? { 'mcp-session-id': session } : {}),
+})
+
+const initialize = (id: number) => ({
+  jsonrpc: '2.0',
+  id,
+  method: 'initialize',
+  params: {
+    protocolVersion: '2024-11-05',
+    capabilities: {},
+    clientInfo: { name: 'reaping', version: '1.0.0' },
+  },
+})
+
+async function openSessions(
+  t: TestContext,
+  extra: string[],
+  count: number,
+  withDescendant = false,
+) {
+  const marker = `reaping-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const port = await unusedPort()
+  const gateway = launchGateway(
+    t,
+    [
+      '--stdio',
+      withDescendant
+        ? 'node tests/helpers/mock-mcp-server.js stdio'
+        : peerWithMarker(marker),
+      '--port',
+      String(port),
+      ...extra,
+    ],
+    withDescendant
+      ? { SUPERGATEWAY_TEST_DESCENDANT_MARKER: `${marker}-grandchild` }
+      : undefined,
+  )
+  await gateway.ready()
+  const url = `http://127.0.0.1:${port}/mcp`
+  const sessions: string[] = []
+  for (let i = 1; i <= count; i++) {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify(initialize(i)),
+      signal: AbortSignal.timeout(requestTimeout(8000)),
+    })
+    await response.text()
+    const id = response.headers.get('mcp-session-id')
+    if (id) sessions.push(id)
+  }
+  return { marker, url, sessions, gateway }
+}
+
+const settle = () => new Promise((resolve) => setTimeout(resolve, 3000))
+
+test(
+  'stateful HTTP reaps a session’s child on explicit DELETE',
+  { timeout: gatewayTimeout(30000) },
+  async (t) => {
+    const { marker, url, sessions, gateway } = await openSessions(
+      t,
+      ['--outputTransport', 'streamableHttp', '--stateful'],
+      3,
+    )
+    for (const session of sessions) {
+      const ended = await fetch(url, {
+        method: 'DELETE',
+        headers: headers(session),
+        signal: AbortSignal.timeout(requestTimeout(5000)),
+      })
+      await ended.text()
+    }
+    await settle()
+    assert.deepEqual(
+      liveChildren(marker, gateway.child.pid!),
+      [],
+      'no child may outlive the session that spawned it',
+    )
+  },
+)
+
+test(
+  'stateful session close reaps the child’s descendant process (#141)',
+  { timeout: 30000 },
+  async (t) => {
+    const { marker, url, sessions, gateway } = await openSessions(
+      t,
+      ['--outputTransport', 'streamableHttp', '--stateful'],
+      1,
+      true,
+    )
+    assert.equal(sessions.length, 1)
+    const grandchild = `${marker}-grandchild`
+    await gateway.waitFor(
+      () => liveChildren(grandchild, gateway.child.pid!).length === 1,
+      'spawn a real MCP descendant',
+    )
+    const ended = await fetch(url, {
+      method: 'DELETE',
+      headers: headers(sessions[0]),
+      signal: AbortSignal.timeout(requestTimeout(5000)),
+    })
+    assert.equal(ended.status, 200)
+    await ended.text()
+    await settle()
+    assert.deepEqual(
+      liveChildren(grandchild, gateway.child.pid!),
+      [],
+      'closing the session must terminate the whole process group',
+    )
+  },
+)
+
+test(
+  'stateful HTTP reaps an idle session’s child when --sessionTimeout is set',
+  { timeout: gatewayTimeout(30000) },
+  async (t) => {
+    const { marker, gateway } = await openSessions(
+      t,
+      [
+        '--outputTransport',
+        'streamableHttp',
+        '--stateful',
+        '--sessionTimeout',
+        '800',
+      ],
+      3,
+    )
+    await settle()
+    assert.deepEqual(
+      liveChildren(marker, gateway.child.pid!),
+      [],
+      'the idle timer must reap every child it was given',
+    )
+  },
+)
+
+/**
+ * Correction to the former #141 reproducer: no session termination happened.
+ * Three children after three initializations are expected when idle expiry is
+ * disabled. Assert that the original children remain usable, not only alive.
+ * statefulSessionContinuityE2e additionally checks peer PID and retained state.
+ */
+test(
+  'stateful HTTP preserves sessions between responses when idle expiry is disabled',
+  { timeout: gatewayTimeout(30000) },
+  async (t) => {
+    const { marker, url, sessions, gateway } = await openSessions(
+      t,
+      ['--outputTransport', 'streamableHttp', '--stateful'],
+      3,
+    )
+    assert.equal(sessions.length, 3)
+    const original = liveChildren(marker, gateway.child.pid!)
+    assert.ok(original.length >= 3)
+    await settle()
+    assert.deepEqual(
+      liveChildren(marker, gateway.child.pid!),
+      original,
+      'response completion must not destroy a live session’s child',
+    )
+    for (const session of sessions) {
+      const listed = await rpc(
+        url,
+        { jsonrpc: '2.0', id: 10, method: 'tools/list' },
+        session,
+      )
+      assert.equal(listed.response.status, 200)
+      assert.equal(listed.messages.length, 1)
+      assert.equal(listed.messages[0].id, 10)
+      assert.ok(Array.isArray(listed.messages[0].result.tools))
+    }
+  },
+)
+
+/**
+ * #108. The stateless gateway spawns a child per POST and has no
+ * response-completion hook used to be absent, so nothing closed its transport
+ * or killed its child. Keep the completed-request leak as a regression test.
+ */
+test(
+  'stateless HTTP reaps the child it spawned for a completed request (#108)',
+  { timeout: gatewayTimeout(30000) },
+  async (t) => {
+    const { marker, gateway } = await openSessions(
+      t,
+      ['--outputTransport', 'streamableHttp'],
+      3,
+    )
+    await settle()
+    assert.deepEqual(
+      liveChildren(marker, gateway.child.pid!),
+      [],
+      'one completed request must not leave a process behind',
+    )
+  },
+)

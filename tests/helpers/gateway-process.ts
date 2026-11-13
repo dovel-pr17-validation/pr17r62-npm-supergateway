@@ -1,0 +1,434 @@
+import { fileURLToPath } from 'node:url'
+import {
+  spawn,
+  type ChildProcess,
+  type ChildProcessWithoutNullStreams,
+  type StdioOptions,
+} from 'node:child_process'
+import { connect, createServer } from 'node:net'
+import { randomInt } from 'node:crypto'
+import { setTimeout as delay } from 'node:timers/promises'
+import type { TestContext } from 'node:test'
+import { watchGateway, forgetGateway } from './leak-check.js'
+import { readyTimeout, requestTimeout, slowHostFactor } from './slow-host.js'
+
+export { requestTimeout }
+
+// A test has to outlive its own readiness wait. node:test kills the test at its
+// timeout and reports only that it timed out, so a per-test timeout below the
+// readiness budget throws away the diagnosis the wait exists to produce — and
+// the two are written in different files, so they invert silently. Deriving one
+// from the other keeps a raised budget from blinding the tests it is meant to
+// help.
+// Capped so that one hung test is over well inside the six minutes of silence
+// the soak allows a group of them (GROUP_BUDGET in scripts/overnight-release.mjs).
+const maxTestTimeout = 240000
+
+export const gatewayTimeout = (ms: number) =>
+  Math.max(
+    Math.min(Math.round(ms * slowHostFactor()), maxTestTimeout),
+    readyTimeout() + 7000,
+  )
+
+// A stalled gateway that writes nothing cannot, by itself, tell a stuck gateway
+// from a host that could not have started any process. Timing a bare Node start
+// at the moment of failure can: it is tens of milliseconds on a healthy runner,
+// so a second or more is the host, not the gateway. Kept short so it fits
+// inside what the test has left.
+const controlBudget = 2000
+
+/**
+ * The command that runs the gateway: `node dist/index.js` by default, or the
+ * standalone executable (#50) named by SUPERGATEWAY_TEST_BINARY, so the same
+ * tests check the executable a release ships. An executable has no command
+ * line for Node, so Node flags reach it through NODE_OPTIONS, which it honours.
+ */
+export function gatewayCommand(args: string[], nodeArgs: string[] = []) {
+  const binary = process.env.SUPERGATEWAY_TEST_BINARY
+  if (binary)
+    return {
+      command: binary,
+      argv: args,
+      nodeOptions: nodeArgs
+        .map((arg) => (/\s/.test(arg) ? JSON.stringify(arg) : arg))
+        .join(' '),
+    }
+  return {
+    command: process.env.SUPERGATEWAY_TEST_NODE ?? process.execPath,
+    argv: [
+      ...nodeArgs,
+      process.env.SUPERGATEWAY_TEST_ENTRY ?? 'dist/index.js',
+      ...args,
+    ],
+    nodeOptions: '',
+  }
+}
+
+// Launch the actual compiled CLI. A separate process group also lets teardown
+// reap the shell and stdio MCP child, even when an assertion fails.
+const consoleSignals = fileURLToPath(
+  new URL('./windows-console-signals.cjs', import.meta.url),
+)
+
+/**
+ * How to start a gateway that will be stopped the way its user stops one. On
+ * POSIX: its own process group, which a teardown can end whole. On Windows,
+ * where one process "signalling" another terminates it before it can stop its
+ * servers: the preload and IPC channel through which `interruptGateway`
+ * delivers a signal as the console would (windows-console-signals.cjs).
+ */
+export const signalledGateway =
+  process.platform === 'win32'
+    ? {
+        nodeArgs: ['--require', consoleSignals],
+        stdio: ['pipe', 'pipe', 'pipe', 'ipc'] as StdioOptions,
+        detached: false,
+      }
+    : {
+        nodeArgs: [] as string[],
+        stdio: 'pipe' as StdioOptions,
+        detached: true,
+      }
+
+/** A signal to a gateway started with `signalledGateway`, to it alone. */
+export function interruptGateway(child: ChildProcess, name: NodeJS.Signals) {
+  if (process.platform !== 'win32') {
+    try {
+      child.kill(name)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+    }
+  } else if (child.connected) child.send(name)
+}
+
+export function launchGateway(
+  t: TestContext,
+  args: string[],
+  env?: Record<string, string>,
+  nodeArgs: string[] = [],
+) {
+  const grouped = process.platform !== 'win32'
+  const windows = process.platform === 'win32'
+  const { command, argv, nodeOptions } = gatewayCommand(args, [
+    ...nodeArgs,
+    ...signalledGateway.nodeArgs,
+  ])
+  const child = spawn(command, argv, {
+    stdio: signalledGateway.stdio,
+    detached: signalledGateway.detached,
+    env: {
+      ...process.env,
+      ...env,
+      // The executable's preloads join the test's own NODE_OPTIONS, if it set
+      // any, rather than replace them.
+      ...(nodeOptions && {
+        NODE_OPTIONS: [
+          env?.NODE_OPTIONS ?? process.env.NODE_OPTIONS,
+          nodeOptions,
+        ]
+          .filter(Boolean)
+          .join(' '),
+      }),
+    },
+  }) as ChildProcessWithoutNullStreams
+  let output = ''
+  let errors = ''
+  // A readiness failure reports whatever was captured, and "nothing at all" is
+  // a different diagnosis from "something, but not the ready line": the gateway
+  // logs `Starting...` within milliseconds of the entry running, so empty
+  // streams mean it never reached its own first line.
+  const spawnedAt = Date.now()
+  let firstByteAt: number | null = null
+  const record = (chunk: string) => {
+    firstByteAt ??= Date.now()
+    return chunk
+  }
+  child.stdout.setEncoding('utf8').on('data', (chunk) => {
+    output += record(chunk)
+  })
+  child.stderr.setEncoding('utf8').on('data', (chunk) => {
+    errors += record(chunk)
+  })
+  let spawnError: Error | null = null
+  const exited = new Promise<{ code: number | null; signal: string | null }>(
+    (resolve, reject) => {
+      child.once('error', (error) => {
+        spawnError = error
+        reject(error)
+      })
+      child.once('exit', (code, signal) => resolve({ code, signal }))
+    },
+  )
+  // A spawn error rejects this long before any consumer awaits it, and an
+  // unhandled rejection takes down the whole test file with a stack that names
+  // node:internal rather than the gateway that failed. Record it instead and
+  // let `waitFor` report it; teardown uses the non-rejecting alias.
+  const settled = exited.then(
+    (value) => value,
+    () => ({ code: null, signal: null }),
+  )
+  const signal = (name: NodeJS.Signals) => {
+    // Windows: anything short of a kill reaches the gateway the console's way.
+    if (windows && name !== 'SIGKILL' && child.connected) {
+      child.send(name)
+      return
+    }
+    try {
+      if (grouped && child.pid) process.kill(-child.pid, name)
+      else child.kill(name)
+    } catch (error) {
+      // ESRCH: the group is already gone. EPERM: it is gone and the pid has been
+      // recycled into a group we do not own — which is likely precisely when the
+      // gateway under test was supposed to exit on its own. Neither means this
+      // test failed, and treating EPERM as fatal made cleanup racy.
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== 'ESRCH' && code !== 'EPERM') throw error
+    }
+  }
+  // A signal to the gateway alone, as its user sends one to stop it.
+  const interrupt = (name: NodeJS.Signals) => interruptGateway(child, name)
+  watchGateway(child.pid, `gateway ${args.slice(0, 2).join(' ')}`, spawnedAt)
+  t.after(async () => {
+    forgetGateway(child.pid)
+    signal('SIGTERM')
+    await Promise.race([settled, delay(6500, undefined, { ref: false })])
+    // The CLI may already have exited, leaving its stdio child behind.
+    signal('SIGKILL')
+    await settled
+  })
+  // Property tests launch a gateway per generated case and must not leave them
+  // all running until the test ends. `t.after` still fires afterwards and
+  // tolerates an already-dead group.
+  const dispose = async () => {
+    forgetGateway(child.pid)
+    signal('SIGTERM')
+    await Promise.race([settled, delay(6500, undefined, { ref: false })])
+    signal('SIGKILL')
+    await settled
+  }
+  const describe = (elapsed: number, polls: number, budget: number) => {
+    const state = spawnError
+      ? `spawn failed (${spawnError.message})`
+      : child.exitCode !== null
+        ? `exited with code ${child.exitCode}`
+        : child.signalCode !== null
+          ? `killed by ${child.signalCode}`
+          : 'still running'
+    const wrote =
+      firstByteAt === null
+        ? 'wrote nothing'
+        : `wrote ${output.length + errors.length} chars, first ${firstByteAt - spawnedAt}ms after spawn`
+    return [
+      `pid ${child.pid ?? 'unassigned'}`,
+      state,
+      wrote,
+      `waited ${elapsed}ms of ${budget}ms over ${polls} polls`,
+      `${Date.now() - spawnedAt}ms since spawn`,
+    ].join('; ')
+  }
+  const controlStart = async () => {
+    const probeStart = Date.now()
+    const probe = spawn(
+      process.env.SUPERGATEWAY_TEST_NODE ?? process.execPath,
+      ['-e', 'process.stdout.write("up")'],
+      { stdio: ['ignore', 'pipe', 'ignore'] },
+    )
+    const outcome = await Promise.race([
+      new Promise<string>((resolve) => {
+        probe.stdout.once('data', () => resolve(`${Date.now() - probeStart}ms`))
+        probe.once('error', (error) =>
+          resolve(`could not spawn (${error.message})`),
+        )
+        probe.once('exit', () =>
+          resolve(`silent, exited after ${Date.now() - probeStart}ms`),
+        )
+      }),
+      delay(controlBudget, undefined, { ref: false }).then(
+        () => `still silent after ${controlBudget}ms`,
+      ),
+    ])
+    try {
+      probe.kill('SIGKILL')
+    } catch {
+      // Already gone; the measurement is what matters.
+    }
+    return outcome
+  }
+  const waitFor = async (predicate: () => boolean, description: string) => {
+    const startedAt = Date.now()
+    const budget = readyTimeout()
+    const deadline = startedAt + budget
+    // The poll count separates "the gateway is stuck" from "this whole runner
+    // was starved": the loop asks for 10ms and burns at least that much, so a
+    // healthy host completes close to `elapsed / 10` passes. Far fewer means
+    // the test process itself was not being scheduled, and the gateway never
+    // had the CPU to reach its first log line either.
+    let polls = 0
+    while (!predicate()) {
+      if (
+        child.exitCode !== null ||
+        child.signalCode !== null ||
+        spawnError ||
+        Date.now() > deadline
+      ) {
+        const state = describe(Date.now() - startedAt, polls, budget)
+        const control = await controlStart()
+        throw Error(
+          `Gateway did not ${description} [${state}; bare node start took ${control}]:\n${output}\n${errors}`,
+        )
+      }
+      polls++
+      await delay(10)
+    }
+  }
+  return {
+    child,
+    exited,
+    signal,
+    interrupt,
+    dispose,
+    waitFor,
+    // Callers that count descendants need this to date the walk once the
+    // gateway has exited; see descendantsOf's `since`.
+    spawnedAt,
+    output: () => output,
+    errors: () => errors,
+    ready: () =>
+      waitFor(
+        () => /Listening on port|Stdio server listening/.test(output + errors),
+        'become ready',
+      ),
+  }
+}
+
+// Probe the same wildcard address the gateway binds, outside the usual OS
+// outgoing ephemeral range and above Fetch-blocked ports. A loopback port-0 probe can pick an IPv6-occupied
+// port or one that a subsequent HTTP connection claims before gateway startup.
+// This is still a probe, not a reservation; keep previously issued ports out
+// of reuse for the rest of this test process.
+//
+// The loopback address is probed as well: a program listening on 127.0.0.1
+// alone leaves the wildcard bind free, the gateway starts, and the test's
+// requests to 127.0.0.1 are answered by that program instead.
+const issued = new Set<number>()
+
+const canListen = async (port: number, host?: string) => {
+  const server = createServer()
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(port, host, resolve)
+    })
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EADDRINUSE') return false
+    throw error
+  }
+  await new Promise<void>((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  )
+  return true
+}
+
+export async function unusedPort() {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const port = randomInt(20000, 32768)
+    if (issued.has(port)) continue
+    if (!(await canListen(port)) || !(await canListen(port, '127.0.0.1')))
+      continue
+    issued.add(port)
+    return port
+  }
+  throw Error('Could not find an unused gateway test port')
+}
+
+/**
+ * Resolves once something accepts connections on `port`. For a gateway
+ * started without `launchGateway`, whose log is not read: how long it takes
+ * to start is the machine's business, and a fixed wait is a guess at it.
+ */
+export async function listening(port: number, host = 'localhost') {
+  const deadline = Date.now() + readyTimeout()
+  for (;;) {
+    const open = await new Promise<boolean>((resolve) => {
+      const socket = connect(port, host)
+      socket.once('connect', () => {
+        socket.destroy()
+        resolve(true)
+      })
+      socket.once('error', () => resolve(false))
+    })
+    if (open) return
+    if (Date.now() > deadline)
+      throw Error(`Nothing listened on ${host}:${port}`)
+    await delay(50)
+  }
+}
+
+export const peerCommand = 'node tests/helpers/mock-mcp-server.js stdio'
+
+/**
+ * The `--stdio` command line that runs `node <args>`. On POSIX it is prefixed
+ * with `exec`, so the server replaces the shell and is the gateway's own child,
+ * as the tests that signal it or read its pid expect. cmd.exe has no `exec`:
+ * on Windows the server runs beneath the shell, as it does for every Windows
+ * user, and a test that cares has to know that.
+ */
+export const nodeServer = (...args: string[]) =>
+  `${process.platform === 'win32' ? '' : 'exec '}node ${args.join(' ')}`
+export async function stdioRpc(
+  gateway: ReturnType<typeof launchGateway>,
+  message: { id: string | number; [key: string]: unknown },
+) {
+  const response = () =>
+    gateway
+      .output()
+      .split('\n')
+      .slice(0, -1)
+      .filter((line) => line.startsWith('{'))
+      .map((line) => JSON.parse(line))
+      .find((result) => result.id === message.id)
+  gateway.child.stdin.write(JSON.stringify(message) + '\n')
+  await gateway.waitFor(
+    () => Boolean(response()),
+    `reply to request ${message.id}`,
+  )
+  return response()
+}
+
+export const initialize = (id: number | string = 1) => ({
+  jsonrpc: '2.0',
+  id,
+  method: 'initialize',
+  params: {
+    protocolVersion: '2024-11-05',
+    capabilities: {},
+    clientInfo: { name: 'e2e', version: '1.0.0' },
+  },
+})
+
+export async function rpc(url: string, message: object, session?: string) {
+  const response = await fetch(url, {
+    method: 'POST',
+    // Setup, like the other request budgets: a loaded soak runner once took
+    // longer than a fixed five seconds to start a stateful session's child.
+    signal: AbortSignal.timeout(requestTimeout(5000)),
+    headers: {
+      'content-type': 'application/json',
+      accept: 'application/json, text/event-stream',
+      ...(session ? { 'mcp-session-id': session } : {}),
+    },
+    body: JSON.stringify(message),
+  })
+  const text = await response.text()
+  const messages = response.headers
+    .get('content-type')
+    ?.includes('text/event-stream')
+    ? text
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith('data:'))
+        .map((line) => JSON.parse(line.slice(5)))
+    : text
+      ? [JSON.parse(text)]
+      : []
+  return { response, messages }
+}

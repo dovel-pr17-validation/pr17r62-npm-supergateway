@@ -1,0 +1,191 @@
+// Runs one battery driver against every output transport and fails the process
+// if any scenario fails.
+//
+// Usage: node tests/clients/run-battery.mjs <driver> [command...]
+//   driver: node | python | go | ruby
+//   command: how to run the non-node drivers: an executable, or a program and
+//     its first arguments (`python tests/clients/battery.py`), which is how
+//     Windows runs a script, having no #! line to read
+//
+// The gateway is launched with a retry, because asking the OS for a free port
+// and then handing it to a child leaves a window in which something else can
+// take it. That race produced two false "gateway died" findings before it was
+// fixed here; a crash caused by a *request* happens after startup, so retrying
+// startup cannot mask one.
+import { spawn } from 'node:child_process'
+import net from 'node:net'
+import { setTimeout as delay } from 'node:timers/promises'
+import { execFileSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+
+const DRIVER = process.argv[2]
+const COMMAND = process.argv.slice(3)
+const PEER = process.env.BATTERY_PEER ?? 'node tests/clients/battery-peer.mjs'
+
+// Deliberately below the smallest limit any SDK imposes on a single SSE event
+// (1 MiB, in the Python and Go clients). Sizes at or above it are an
+// interoperability question rather than a conformance one — see GW-023 — and
+// this job is here to catch regressions, not to re-litigate that.
+const BIG_LENGTH = process.env.BIG_LENGTH ?? '524288'
+
+const freePort = () =>
+  new Promise((r) => {
+    const s = net.createServer()
+    s.listen(0, '127.0.0.1', () => {
+      const p = s.address().port
+      s.close(() => r(p))
+    })
+  })
+
+// Windows has no signals between processes and no process groups: SIGTERM
+// there would end the gateway before it stops its servers. The gateway gets
+// it as its console would deliver it (tests/helpers/windows-console-signals.cjs),
+// and a gateway that will not stop has its tree ended by taskkill.
+const windows = process.platform === 'win32'
+const consoleSignals = fileURLToPath(
+  new URL('../helpers/windows-console-signals.cjs', import.meta.url),
+)
+
+async function launch(args) {
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    const port = await freePort()
+    const gw = spawn(
+      process.env.SUPERGATEWAY_TEST_NODE ?? process.execPath,
+      [
+        ...(windows ? ['--require', consoleSignals] : []),
+        process.env.SUPERGATEWAY_TEST_ENTRY ?? 'dist/index.js',
+        ...args.map((a) => (a === '$PORT' ? String(port) : a)),
+      ],
+      {
+        stdio: windows ? ['pipe', 'pipe', 'pipe', 'ipc'] : 'pipe',
+        detached: !windows,
+        env: { ...process.env, BIG_LENGTH },
+      },
+    )
+    let out = ''
+    gw.stdout.setEncoding('utf8').on('data', (c) => (out += c))
+    gw.stderr.setEncoding('utf8').on('data', (c) => (out += c))
+    const alive = () => gw.exitCode === null && gw.signalCode === null
+    const closed = new Promise((resolve) => gw.once('close', resolve))
+    const stop = async () => {
+      // Stdio children own separate groups; allow the gateway to drain them.
+      if (alive()) {
+        if (windows && gw.connected) gw.send('SIGTERM')
+        else gw.kill('SIGTERM')
+      }
+      await Promise.race([closed, delay(6500, undefined, { ref: false })])
+      if (alive()) {
+        try {
+          if (windows)
+            execFileSync('taskkill.exe', ['/PID', String(gw.pid), '/T', '/F'], {
+              stdio: 'ignore',
+              windowsHide: true,
+            })
+          else process.kill(-gw.pid, 'SIGKILL')
+        } catch {}
+        await closed
+      }
+    }
+    const deadline = Date.now() + 15000
+    while (Date.now() < deadline && alive() && !/listening/i.test(out))
+      await new Promise((r) => setTimeout(r, 60))
+    if (alive() && /listening/i.test(out)) {
+      await new Promise((r) => setTimeout(r, 300))
+      return { port, stop, out: () => out }
+    }
+    await stop()
+  }
+  throw new Error('gateway never started')
+}
+
+// The driver runs while this process keeps reading the gateway's output. A
+// synchronous run would stop that: the gateway logs each message in full, and
+// on Windows, where a process writes to a pipe synchronously, a 512 KB result
+// left unread there stalls the gateway before it can send the reply.
+function driver(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      env: { ...process.env, BIG_LENGTH },
+      stdio: ['ignore', 'pipe', 'inherit'],
+    })
+    let stdout = ''
+    child.stdout.setEncoding('utf8').on('data', (chunk) => (stdout += chunk))
+    const timer = setTimeout(() => child.kill(), 120000)
+    child.once('error', reject)
+    child.once('close', (code, signal) => {
+      clearTimeout(timer)
+      if (code === 0) resolve(stdout)
+      else
+        reject(
+          Object.assign(
+            new Error(`driver exited with ${signal ?? `code ${code}`}`),
+            { stdout },
+          ),
+        )
+    })
+  })
+}
+
+const MODES = (process.env.BATTERY_MODES ?? 'stateful,stateless,sse').split(',')
+const report = []
+let failures = 0
+
+for (const mode of MODES) {
+  const args = ['--stdio', PEER, '--port', '$PORT']
+  if (mode === 'sse') args.push('--outputTransport', 'sse')
+  else if (mode === 'stateful')
+    args.push('--outputTransport', 'streamableHttp', '--stateful')
+  else args.push('--outputTransport', 'streamableHttp')
+
+  const gateway = await launch(args)
+  const url =
+    mode === 'sse'
+      ? `http://127.0.0.1:${gateway.port}/sse`
+      : `http://127.0.0.1:${gateway.port}/mcp`
+  const kind = mode === 'sse' ? 'sse' : 'http'
+
+  let rows
+  try {
+    const out = await driver(DRIVER === 'node' ? 'node' : COMMAND[0], [
+      ...(DRIVER === 'node' ? ['tests/clients/battery.mjs'] : COMMAND.slice(1)),
+      url,
+      kind,
+    ])
+    rows = JSON.parse(out.trim().split('\n').pop())
+  } catch (e) {
+    rows = [
+      {
+        name: 'driver',
+        ok: false,
+        detail: String(e.stdout || e.message).slice(0, 200),
+      },
+    ]
+  }
+
+  report.push({ mode, driver: DRIVER, rows })
+  const bad = rows.filter((r) => !r.ok)
+  failures += bad.length
+  console.log(
+    `${DRIVER} / ${mode}: ${rows.length - bad.length}/${rows.length} scenarios passed`,
+  )
+  for (const r of bad) console.log(`  FAIL ${r.name}: ${r.detail}`)
+  if (bad.length && process.env.BATTERY_TRACE === '1')
+    console.log(
+      `gateway log, last 4000 characters:\n${gateway.out().slice(-4000)}`,
+    )
+  await gateway.stop()
+}
+
+if (process.env.BATTERY_REPORT) {
+  const { writeFileSync } = await import('node:fs')
+  writeFileSync(
+    process.env.BATTERY_REPORT,
+    JSON.stringify(report, null, 2) + '\n',
+  )
+}
+
+if (failures > 0) {
+  console.error(`\n${DRIVER}: ${failures} scenario failure(s)`)
+  process.exit(1)
+}
+console.log(`\n${DRIVER}: every scenario passed on every transport.`)

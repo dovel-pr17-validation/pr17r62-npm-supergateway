@@ -1,0 +1,343 @@
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import type { TestContext } from 'node:test'
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
+import { WebSocketClientTransport } from '@modelcontextprotocol/sdk/client/websocket.js'
+// The `ws` client, not the global one: `WebSocket` is undefined on Node 20,
+// which the compat job still covers, and the SDK's transport needs one.
+import { WebSocket } from 'ws'
+import {
+  LoggingMessageNotificationSchema,
+  ProgressNotificationSchema,
+  ToolListChangedNotificationSchema,
+  CreateMessageRequestSchema,
+  ListRootsRequestSchema,
+  ElicitRequestSchema,
+} from '@modelcontextprotocol/sdk/types.js'
+import { knownBugTest } from './helpers/known-bug.js'
+import {
+  gatewayTimeout,
+  launchGateway,
+  requestTimeout,
+  unusedPort,
+} from './helpers/gateway-process.js'
+
+/**
+ * The other direction.
+ *
+ * Every other test in this repository — and all five cross-client drivers —
+ * is client-initiated: the client asks, the server answers. MCP is not
+ * one-directional. A server sends log and progress notifications, announces
+ * that its tool list changed, and makes *requests of its own*: `sampling/
+ * createMessage` to borrow the client's model, `roots/list` to ask what it may
+ * touch, `elicitation/create` to ask the user a question. All of that has to
+ * cross the gateway backwards, and nothing was checking that it does.
+ *
+ * `reverse-peer.mjs` exercises all six from the server side.
+ *
+ * Stateful HTTP, SSE and WebSocket relay all six. Stateless HTTP delivers notifications
+ * and declines unsupported reverse requests without hanging (GW-026).
+ * Batched progress callbacks expose a separate upstream SDK defect (GW-027).
+ */
+const MODES = [
+  {
+    label: 'stateful HTTP',
+    args: ['--outputTransport', 'streamableHttp', '--stateful'],
+    path: '/mcp',
+    sse: false,
+    works: true,
+  },
+  {
+    label: 'SSE',
+    args: ['--outputTransport', 'sse'],
+    path: '/sse',
+    sse: true,
+    works: true,
+  },
+  {
+    label: 'stateless HTTP',
+    args: ['--outputTransport', 'streamableHttp'],
+    path: '/mcp',
+    sse: false,
+    works: false,
+  },
+  {
+    label: 'WebSocket',
+    args: ['--outputTransport', 'ws'],
+    path: '/message',
+    sse: false,
+    ws: true,
+    works: true,
+  },
+] as const
+
+type Reply = { content: Array<{ type: string; text: string }> }
+
+interface Observed {
+  client: Client
+  logs: string[]
+  progress: number[]
+  toolsChanged: () => number
+}
+
+async function connect(
+  t: TestContext,
+  mode: (typeof MODES)[number],
+  spacing = '1',
+): Promise<Observed> {
+  const port = await unusedPort()
+  const gateway = launchGateway(
+    t,
+    [
+      '--stdio',
+      'node tests/helpers/reverse-peer.mjs',
+      '--port',
+      String(port),
+      ...mode.args,
+    ],
+    { PROGRESS_SPACING: spacing },
+  )
+  await gateway.ready()
+  const url = new URL(`http://127.0.0.1:${port}${mode.path}`)
+
+  // The client has to advertise these, or the SDK refuses the server's request
+  // before the gateway is ever involved and the test would prove nothing.
+  const client = new Client(
+    { name: 'reverse', version: '1.0.0' },
+    {
+      capabilities: {
+        sampling: {},
+        roots: { listChanged: true },
+        elicitation: {},
+      },
+    },
+  )
+  const logs: string[] = []
+  const progress: number[] = []
+  let changed = 0
+  client.setNotificationHandler(LoggingMessageNotificationSchema, (n) => {
+    logs.push(String(n.params.data))
+  })
+  client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
+    changed++
+  })
+  client.setRequestHandler(CreateMessageRequestSchema, async () => ({
+    model: 'offline-stub',
+    role: 'assistant',
+    content: { type: 'text', text: 'pong' },
+  }))
+  client.setRequestHandler(ListRootsRequestSchema, async () => ({
+    roots: [{ uri: 'file:///tmp/root-a', name: 'a' }],
+  }))
+  client.setRequestHandler(ElicitRequestSchema, async () => ({
+    action: 'accept' as const,
+    content: { name: 'domas' },
+  }))
+
+  t.after(() => client.close().catch(() => {}))
+  if ('ws' in mode) {
+    globalThis.WebSocket ??= WebSocket as unknown as typeof globalThis.WebSocket
+    url.protocol = 'ws:'
+  }
+  await client.connect(
+    'ws' in mode
+      ? new WebSocketClientTransport(url)
+      : mode.sse
+        ? new SSEClientTransport(url)
+        : new StreamableHTTPClientTransport(url),
+  )
+  return { client, logs, progress, toolsChanged: () => changed }
+}
+
+const settle = () => new Promise((resolve) => setTimeout(resolve, 500))
+const textOf = (reply: unknown) =>
+  (reply as Reply).content?.find((c) => c.type === 'text')?.text ?? ''
+
+// What the gateway delivered, counted by a handler of the client's own. The
+// SDK's per-call `onprogress` loses a notification that shares a read with the
+// result (GW-027, below); spacing the peer's notifications 150 ms apart kept
+// them in separate reads until a starved soak runner (4.1.0-rc.0, macOS /
+// Node 20, cycle 4) read the last one with the result and saw [1, 2]. The
+// GW-027 test keeps `onprogress`, so a fixed SDK still shows up there.
+async function progressSeenBy(
+  o: Observed,
+  via: 'handler' | 'onprogress' = 'handler',
+) {
+  const seen: number[] = []
+  if (via === 'handler')
+    o.client.setNotificationHandler(ProgressNotificationSchema, (n) => {
+      seen.push(n.params.progress)
+    })
+  const done = await o.client.callTool(
+    { name: 'progress', arguments: {} },
+    undefined,
+    // Also what makes the SDK send a progress token.
+    { onprogress: (p) => void (via === 'onprogress' && seen.push(p.progress)) },
+  )
+  await settle()
+  assert.match(
+    textOf(done),
+    /^progress-done/,
+    'the progress tool itself failed',
+  )
+  return seen
+}
+
+async function assertReverseDirectionWorks(o: Observed) {
+  const logged = await o.client.callTool({ name: 'log', arguments: {} })
+  await settle()
+  assert.equal(textOf(logged), 'logged')
+  assert.deepEqual(
+    o.logs,
+    ['log-info', 'log-warning', 'log-error'],
+    'logging notifications emitted during the call did not reach the client',
+  )
+
+  const before = o.toolsChanged()
+  await o.client.callTool({ name: 'toolsChanged', arguments: {} })
+  await settle()
+  assert.ok(
+    o.toolsChanged() > before,
+    'the server announced a tool list change and the client never heard it',
+  )
+
+  // The three that are *requests* from the server, each needing a reply routed
+  // back through the gateway to the peer that asked.
+  for (const [tool, expected] of [
+    ['sample', 'sampled:pong'],
+    ['roots', 'roots:file:///tmp/root-a'],
+    ['elicit', 'elicited:accept:domas'],
+  ] as const) {
+    const reply = await o.client.callTool({ name: tool, arguments: {} })
+    assert.equal(
+      textOf(reply),
+      expected,
+      `the server's own ${tool} request did not complete`,
+    )
+  }
+}
+
+for (const mode of MODES.filter((m) => m.works)) {
+  test(
+    `${mode.label}: notifications, sampling, roots and elicitation all cross backwards`,
+    { timeout: gatewayTimeout(90000) },
+    async (t) => {
+      await assertReverseDirectionWorks(await connect(t, mode))
+    },
+  )
+}
+
+for (const mode of MODES.filter((m) => m.works)) {
+  test(
+    `${mode.label}: every progress notification reaches the caller`,
+    { timeout: gatewayTimeout(90000) },
+    async (t) => {
+      assert.deepEqual(await progressSeenBy(await connect(t, mode)), [1, 2, 3])
+    },
+  )
+}
+
+/**
+ * GW-027, and it is not ours.
+ *
+ * Emit three progress notifications back to back and the caller's `onprogress`
+ * fires once. Space them 150ms apart and all three arrive. Measured:
+ *
+ *     spacing 0ms    stateful [1,2,3]   sse [1]
+ *     spacing 150ms  stateful [1,2,3]   sse [1,2,3]
+ *
+ * The mechanism, established rather than guessed — my first theory was that the
+ * gateway's fire-and-forget `transport.send` reordered messages, and serialising
+ * those sends changed nothing, which is what sent me looking further:
+ *
+ *  1. The raw SSE stream carries all three notifications, correctly framed,
+ *     ahead of the result.
+ *  2. A client that installs its own `notifications/progress` handler receives
+ *     all three.
+ *  3. When several events share one TCP chunk, the SDK dispatches them in one
+ *     synchronous pass. `Protocol._onnotification` defers its handler through
+ *     `Promise.resolve().then(...)`, while `Protocol._onresponse` deletes
+ *     `_progressHandlers` **synchronously**. The result is in that same batch,
+ *     so by the time the deferred progress handlers run, the handler they need
+ *     is gone.
+ *
+ * So it is an upstream defect in the MCP TypeScript SDK, verified present in
+ * both 1.18.2 (our lockfile) and 1.30.0 (the latest), and supergateway merely
+ * exposes it: SSE reliably batches, streamable HTTP batches under load — the
+ * stateful case failed this way once during an instrumented full-suite run.
+ *
+ * Kept here because it is our users who see it, and because if a future SDK
+ * fixes the ordering this test says so immediately. Worth reporting upstream.
+ */
+const stateless = MODES.find((m) => !m.works)!
+
+knownBugTest(
+  'GW-027',
+  'SSE: progress notifications batched with the result are not lost',
+  { timeout: gatewayTimeout(90000) },
+  async (t) => {
+    const o = await connect(t, MODES[1], '0')
+    assert.deepEqual(await progressSeenBy(o, 'onprogress'), [1, 2, 3])
+  },
+)
+
+// GW-026: route notifications through the active POST response.
+test(
+  `${stateless.label}: a notification emitted during a call reaches the client`,
+  { timeout: gatewayTimeout(90000) },
+  async (t) => {
+    const o = await connect(t, stateless)
+    const logged = await o.client.callTool({ name: 'log', arguments: {} })
+    await settle()
+    assert.equal(
+      textOf(logged),
+      'logged',
+      'the call itself should still succeed',
+    )
+    assert.deepEqual(o.logs, ['log-info', 'log-warning', 'log-error'])
+  },
+)
+
+// The SDK peer reports a tool error promptly, either from its own capability
+// checks or from the gateway rejection. Raw-peer tests prove the wire error.
+test(
+  `${stateless.label}: a server-initiated request fails fast instead of hanging`,
+  { timeout: gatewayTimeout(90000) },
+  async (t) => {
+    const o = await connect(t, stateless)
+    for (const tool of ['sample', 'roots', 'elicit']) {
+      const reply = await o.client.callTool(
+        { name: tool, arguments: {} },
+        undefined,
+        { timeout: requestTimeout(8000) },
+      )
+      assert.equal(
+        reply.isError,
+        true,
+        `${tool} must report unsupported capability`,
+      )
+      assert.match(
+        textOf(reply),
+        /Client does not support|MCP error -32601: Server-to-client requests are not supported in stateless mode/,
+      )
+    }
+  },
+)
+
+test(
+  'stateless HTTP: progress and tool-list notifications reach the active caller',
+  { timeout: gatewayTimeout(90000) },
+  async (t) => {
+    const o = await connect(t, stateless)
+    assert.deepEqual(await progressSeenBy(o), [1, 2, 3])
+    const reply = await o.client.callTool({
+      name: 'toolsChanged',
+      arguments: {},
+    })
+    await settle()
+    assert.equal(textOf(reply), 'announced')
+    assert.equal(o.toolsChanged(), 1)
+  },
+)

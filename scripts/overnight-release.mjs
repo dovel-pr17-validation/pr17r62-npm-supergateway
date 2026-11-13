@@ -1,0 +1,270 @@
+// Repeated checks of an installed public artifact. No publication or credentials.
+import assert from 'node:assert/strict'
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
+import { createSoakCommandGroup } from './soak-command-group.mjs'
+
+assert.equal(process.env.SUPERGATEWAY_SOAK_CONFIRMED, '1')
+const seconds = Number(process.env.SOAK_SECONDS ?? 10800)
+assert.ok(Number.isFinite(seconds) && seconds >= 60 && seconds <= 21600)
+const entry = resolve(process.env.SUPERGATEWAY_TEST_ENTRY)
+const pkg = JSON.parse(
+  readFileSync(resolve(entry, '../../package.json'), 'utf8'),
+)
+assert.equal(pkg.name, 'supergateway')
+assert.equal(pkg.version, '4.2.2')
+assert.equal(process.env.SOAK_PACKAGE_VERSION, pkg.version)
+const artifact = JSON.parse(
+  readFileSync(resolve(entry, '../../../../artifact.json'), 'utf8'),
+)
+assert.equal(artifact.version, pkg.version)
+assert.equal(artifact.sha256, process.env.SOAK_PACKAGE_SHA256)
+assert.match(artifact.sha256, /^[a-f0-9]{64}$/)
+const root = resolve(process.env.SOAK_DIRECTORY ?? '.release/overnight')
+mkdirSync(root, { recursive: true })
+const started = Date.now()
+let deadline = started + seconds * 1000
+const events = (event) => {
+  const row = { time: new Date().toISOString(), ...event }
+  appendFileSync(resolve(root, 'events.jsonl'), JSON.stringify(row) + '\n')
+  console.log(JSON.stringify(row))
+}
+const env = { ...process.env, SUPERGATEWAY_TEST_ENTRY: entry }
+// The first failure stops the lane, and the workflow then cancels the run, so
+// nobody waits out a phase that has already failed. With SOAK_KEEP_GOING=1
+// (the soak workflow's `keep_going`) a failure is recorded and the phase runs
+// on to its deadline instead, for the hours of evidence after it.
+const commands = createSoakCommandGroup({
+  root,
+  events,
+  env,
+  keepGoing: process.env.SOAK_KEEP_GOING === '1',
+})
+const { run } = commands
+for (const signal of ['SIGINT', 'SIGTERM'])
+  process.once(signal, () => commands.cancel(signal, true))
+const modern = [
+  'modernProtocol',
+  'modernTransparency',
+  'modernAutoCompatibility',
+  'modernHttpSafety',
+  'modernRelayEdges',
+  'protocolVersionMatrix',
+  'modernContinuationBoundary',
+]
+const portable = [
+  'modernContinuation',
+  'gatewayE2e',
+  'bridgeResultE2e',
+  'bridgeWireResponsesE2e',
+  'bridgePipeliningE2e',
+  'headerNamesE2e',
+  'credentialHeaders',
+  'serverInitiated',
+  'statefulSessionContinuityE2e',
+  'sseReconnect',
+  'sseDisconnectSurvival',
+  'statelessNotificationsE2e',
+  'utf8ChunkBoundariesE2e',
+  // Behaviour new since 4.0.0: what the bridges relay and cancel,
+  // per-connection WebSocket children, and the stateless handshake.
+  'bridgeServerInitiated',
+  'bridgeCancellation',
+  'wsClientIdentity',
+  'resourcesAndPrompts',
+  'statelessProtocolVersion',
+  'statelessInitializedNotification',
+  'httpResponseHeaders',
+  'httpBodyErrors',
+]
+const lifecycle = [
+  'ownedProcessGroupsE2e',
+  'parentOnlyShutdownE2e',
+  'sessionProcessExitE2e',
+  'httpChildExitSdkE2e',
+  'httpChildIoSdkE2e',
+  'statefulStaleReplyE2e',
+  'statelessLifetimeE2e',
+  'sessionRaceOrdersE2e',
+  'httpDisconnectRegressionE2e',
+]
+// Every platform runs every group: the suite runs on Windows too since #335.
+const groups = [modern, portable, lifecycle]
+events({
+  phase: 'start',
+  seconds,
+  entry,
+  version: pkg.version,
+  runtime: process.version,
+  platform: process.platform,
+  arch: process.arch,
+  groups,
+  sha256: artifact.sha256,
+  resourceSoak: process.env.SOAK_SKIP_RESOURCE !== '1',
+  scenarioSoak: process.env.SOAK_SKIP_SCENARIOS !== '1',
+})
+writeFileSync(resolve(root, 'pid'), String(process.pid))
+// A group of test files reports each test as it ends, so it is judged by its
+// silence, not its length: no test here may run longer than four minutes (the
+// cap in tests/helpers/gateway-process.ts), so six with nothing said is a
+// group that is stuck, on any machine. The forty-five is a backstop for one
+// that keeps talking and never ends; a group takes three to four.
+const GROUP_BUDGET = { quiet: 6 * 60000, cap: 45 * 60000 }
+// What failed inside the battery loop. A failure is recorded and the cycle
+// goes on; only cancellation stops it.
+const batteryErrors = []
+async function attempt(...args) {
+  try {
+    await run(...args)
+  } catch (error) {
+    if (commands.stopped) throw error
+    batteryErrors.push(String(error))
+  }
+}
+async function batteries() {
+  let cycle = 0
+  do {
+    for (let index = 0; index < groups.length; index++) {
+      if (commands.stopped) return
+      // Always complete one scenario pass, even in a short harness canary.
+      if (cycle > 0 && Date.now() >= deadline) return
+      await attempt(
+        `cycle-${cycle}-group-${index}`,
+        [
+          '--import',
+          'tsx',
+          '--test',
+          '--test-concurrency=1',
+          '--test-reporter',
+          './scripts/release-test-reporter.mjs',
+          ...groups[index].map((name) => `tests/${name}.test.ts`),
+        ],
+        GROUP_BUDGET,
+      )
+    }
+    for (const old of [false, true]) {
+      if (commands.stopped) return
+      await attempt(
+        `cycle-${cycle}-sdk-${old ? '1.4' : '1.30'}`,
+        ['tests/clients/run-battery.mjs', 'node'],
+        6 * 60000,
+        {
+          BATTERY_REPORT: resolve(
+            root,
+            `cycle-${cycle}-sdk-${old ? '1.4' : '1.30'}.json`,
+          ),
+          ...(old
+            ? {
+                BATTERY_SDK: 'prev-modelcontextprotocol-sdk',
+                BATTERY_MODES: 'sse',
+              }
+            : {}),
+        },
+      )
+    }
+    // Real servers once per cycle, where the lane has them (see the workflow).
+    if (process.env.SUPERGATEWAY_REAL_SERVERS === '1' && !commands.stopped)
+      await attempt(
+        `cycle-${cycle}-real-servers`,
+        [
+          '--import',
+          'tsx',
+          '--test',
+          '--test-concurrency=1',
+          '--test-reporter',
+          './scripts/release-test-reporter.mjs',
+          'scripts/realServers.test.ts',
+        ],
+        25 * 60000,
+      )
+    // The Inspector CLI through every path it speaks, on the same switch.
+    if (process.env.SUPERGATEWAY_REAL_SERVERS === '1' && !commands.stopped)
+      await attempt(
+        `cycle-${cycle}-inspector`,
+        [
+          '--import',
+          'tsx',
+          '--test',
+          '--test-reporter',
+          './scripts/release-test-reporter.mjs',
+          'scripts/inspectorClient.test.ts',
+        ],
+        25 * 60000,
+      )
+    events({ phase: 'cycle-complete', cycle: cycle++ })
+    await delay(
+      Math.min(60000, Math.max(0, deadline - Date.now())),
+      undefined,
+      { signal: commands.signal },
+    )
+  } while (Date.now() < deadline && !commands.stopped)
+}
+// One finite default-lifetime check per lane/phase, against the installed CLI.
+let preflightError
+try {
+  await run(
+    'continuation-lifetime',
+    [
+      '--import',
+      'tsx',
+      '--test',
+      '--test-reporter',
+      './scripts/release-test-reporter.mjs',
+      'scripts/continuation-lifetime.test.ts',
+    ],
+    9 * 60000,
+  )
+} catch (error) {
+  preflightError = String(error)
+}
+deadline = Date.now() + seconds * 1000
+const jobs = commands.stopped ? [] : [batteries()]
+if (!commands.stopped && process.env.SOAK_SKIP_RESOURCE !== '1')
+  jobs.push(
+    run(
+      'resources',
+      ['--import', 'tsx', 'scripts/soak-release.test.ts'],
+      (seconds + 540) * 1000,
+      { SOAK_REPORT: resolve(root, 'resources.jsonl') },
+    ),
+  )
+// Long-lived bridges, WebSocket isolation, cancellation, large replies,
+// crashes and upstream restarts, with their own resource gates. The hosted
+// soak runs this on runners of its own (SOAK_SKIP_SCENARIOS there): beside the
+// test groups for whole phases it slowed them 2.5x on average and up to 11x.
+if (!commands.stopped && process.env.SOAK_SKIP_SCENARIOS !== '1')
+  jobs.push(
+    run(
+      'scenarios',
+      ['--import', 'tsx', 'scripts/soak-scenarios.test.ts'],
+      (seconds + 420) * 1000,
+      { SOAK_REPORT: resolve(root, 'scenarios.jsonl') },
+    ),
+  )
+const results = await Promise.allSettled(jobs)
+const errors = results
+  .filter((result) => result.status === 'rejected')
+  .map((result) => String(result.reason))
+errors.push(...batteryErrors)
+if (preflightError) errors.unshift(preflightError)
+// A cancelled lane is not a passing lane, but it is not evidence against the
+// release either: the workflow stopped this runner because a *different* job
+// failed, and fail-fast means that job is the one worth reading.
+const status = commands.cancelledExternally
+  ? 'cancelled'
+  : errors.length || commands.failed
+    ? 'failed'
+    : 'passed'
+const summary = {
+  status,
+  seconds,
+  elapsedSeconds: Math.round((Date.now() - started) / 1000),
+  errors,
+}
+writeFileSync(
+  resolve(root, 'summary.json'),
+  JSON.stringify(summary, null, 2) + '\n',
+)
+events({ phase: 'complete', ...summary })
+process.exitCode = summary.status === 'passed' ? 0 : 1
